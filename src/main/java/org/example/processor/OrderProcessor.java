@@ -1,15 +1,16 @@
 package org.example.processor;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.camel.AggregationStrategy;
 import org.apache.camel.CamelContext;
 import org.apache.camel.Exchange;
 import org.apache.camel.LoggingLevel;
 import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.impl.DefaultCamelContext;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.example.model.Order;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -31,16 +32,16 @@ public class OrderProcessor {
                         .filter().method(this, "hasValidTotal")
                         .process(exchange -> {
                             String body = exchange.getIn().getBody(String.class);
-                            String client = body.replaceAll(".*\"client\"\\s*:\\s*\"(.*?)\".*", "$1");
-                            exchange.getIn().setHeader("client", client);
+                            Order order = OBJECT_MAPPER.readValue(body, Order.class);
+                            order.setTimestamp(System.currentTimeMillis());
+                            order.setStatus("Processed");
+                            exchange.getIn().setBody(OBJECT_MAPPER.writeValueAsString(order));
+                            exchange.getIn().setHeader("client", order.getClient());
                         })
                         .aggregate(header("client"), new GroupedBodyAggregationStrategy())
                         .completionTimeout(10000)
                         .log(LoggingLevel.INFO, "Aggregated message: ${body}")
-                        .process(exchange -> {
-                            String aggregatedBody = exchange.getIn().getBody(String.class);
-                            addToJsonFile(aggregatedBody);
-                        });
+                        .process(OrderProcessor::addToJsonFile);
             }
 
             public boolean hasValidTotal(Exchange exchange) {
@@ -54,64 +55,75 @@ public class OrderProcessor {
         context.stop();
     }
 
-    private static void addToJsonFile(String aggregatedBody) {
+    private static void addToJsonFile(Exchange exchange) {
         try {
-            ObjectNode newOrder = (ObjectNode) OBJECT_MAPPER.readTree(aggregatedBody);
-            String clientName = newOrder.get("client").asText();
+            String clientName = exchange.getIn().getHeader("client", String.class);
+            JsonNode ordersBatch = OBJECT_MAPPER.readTree(exchange.getIn().getBody(String.class));
 
-            ArrayNode ordersArray = OBJECT_MAPPER.createArrayNode();
+            ArrayNode rootArray = OBJECT_MAPPER.createArrayNode();
             Path path = Paths.get(FILE_PATH);
+
             if (Files.exists(path)) {
-                String existingContent = new String(Files.readAllBytes(path));
-                if (!existingContent.isEmpty()) {
-                    ordersArray = (ArrayNode) OBJECT_MAPPER.readTree(existingContent);
+                byte[] fileContent = Files.readAllBytes(path);
+                if (fileContent.length > 0) {
+                    rootArray = (ArrayNode) OBJECT_MAPPER.readTree(fileContent);
                 }
             }
 
-            ObjectNode clientNode = null;
-            for (JsonNode node : ordersArray) {
-                if (node.has("client") && node.get("client").asText().equals(clientName)) {
-                    clientNode = (ObjectNode) node;
-                    break;
-                }
+            ObjectNode clientEntry = findOrCreateClientEntry(rootArray, clientName);
+            ArrayNode clientOrders = (ArrayNode) clientEntry.get("orders");
+
+            if (ordersBatch.isArray()) {
+                ordersBatch.forEach(clientOrders::add);
             }
 
-            if (clientNode == null) {
-                clientNode = OBJECT_MAPPER.createObjectNode();
-                clientNode.put("client", clientName);
-                clientNode.set("orders", OBJECT_MAPPER.createArrayNode());
-                ordersArray.add(clientNode);
-            }
-
-            ArrayNode clientOrders = (ArrayNode) clientNode.get("orders");
-            clientOrders.add(newOrder);
-
-            Files.write(path, OBJECT_MAPPER.writeValueAsBytes(ordersArray), StandardOpenOption.CREATE);
+            Files.write(path, OBJECT_MAPPER.writeValueAsBytes(rootArray),
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING);
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
+    private static ObjectNode findOrCreateClientEntry(ArrayNode rootArray, String clientName) {
+        for (JsonNode node : rootArray) {
+            if (node.get("client").asText().equals(clientName)) {
+                return (ObjectNode) node;
+            }
+        }
+
+        ObjectNode newEntry = OBJECT_MAPPER.createObjectNode();
+        newEntry.put("client", clientName);
+        newEntry.set("orders", OBJECT_MAPPER.createArrayNode());
+        rootArray.add(newEntry);
+        return newEntry;
+    }
 
     private static class GroupedBodyAggregationStrategy implements AggregationStrategy {
         @Override
         public Exchange aggregate(Exchange oldExchange, Exchange newExchange) {
-            if (oldExchange == null) {
-                return newExchange;
-            }
-            String oldBody = oldExchange.getIn().getBody(String.class);
-            String newBody = newExchange.getIn().getBody(String.class);
             try {
-                ObjectNode aggregatedOrder = OBJECT_MAPPER.createObjectNode();
-                aggregatedOrder.put("client", oldExchange.getIn().getHeader("client", String.class));
-                aggregatedOrder.putArray("orders").add(OBJECT_MAPPER.readTree(oldBody));
-                aggregatedOrder.putArray("orders").add(OBJECT_MAPPER.readTree(newBody));
+                ArrayNode ordersArray;
 
-                oldExchange.getIn().setBody(aggregatedOrder.toString());
+                if (oldExchange == null) {
+                    ordersArray = OBJECT_MAPPER.createArrayNode();
+                    JsonNode newOrder = OBJECT_MAPPER.readTree(newExchange.getIn().getBody(String.class));
+                    ordersArray.add(newOrder);
+                    newExchange.getIn().setBody(ordersArray.toString());
+                    return newExchange;
+                }
+
+                ordersArray = (ArrayNode) OBJECT_MAPPER.readTree(oldExchange.getIn().getBody(String.class));
+                JsonNode newOrder = OBJECT_MAPPER.readTree(newExchange.getIn().getBody(String.class));
+                ordersArray.add(newOrder);
+
+                oldExchange.getIn().setBody(ordersArray.toString());
+                return oldExchange;
+
             } catch (Exception e) {
                 e.printStackTrace();
+                return oldExchange;
             }
-            return oldExchange;
         }
     }
 }
